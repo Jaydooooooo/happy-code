@@ -20,3 +20,14 @@ export HAPPY_SERVER_URL=https://你的域名
 ```bash
 happy init
 ```
+
+
+卸载命令
+
+```bash
+rm -rf ~/.happy
+rm -rf ~/.config/happy
+rm -rf ~/.cache/happy
+rm -rf ~/.local/share/happy
+```
+
