@@ -6,7 +6,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/happy-code/main/install-happy.sh)
 ```
 
-[安装项目地址命令]（https://github.com/slopus/happy）
+[安装项目地址命令](https://github.com/slopus/happy)
 ```bash
 npm install -g happy-coder
 ```
