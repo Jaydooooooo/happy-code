@@ -23,6 +23,9 @@ happy init
 
 
 卸载命令
+```bash
+npm uninstall -g happy-coder
+```
 
 ```bash
 rm -rf ~/.happy
