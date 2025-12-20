@@ -42,15 +42,23 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ================= Helper: read until marker line =================
-# Reads multi-line input until user enters a line equals MARKER (default: EOF).
+# Reads multi-line input until user enters a line equals MARKER (default: EOF) OR user presses Ctrl-D.
 # - Strips Windows CR (\r)
 # - Trims leading/trailing spaces
-# - Marker line will NOT be written to file
+# - Marker match is case-insensitive (EOF / eof both ok)
+# - Marker line will NOT be written to output
+# Notes:
+# - Always reads from /dev/tty (interactive terminal), so redirection like `> file` is safe.
 read_until_marker() {
   local marker="${1:-EOF}"
   local line cleaned
 
-  while IFS= read -r line; do
+  while true; do
+    # Ctrl-D / true EOF => read fails => stop safely (don't break set -e)
+    if ! IFS= read -r line </dev/tty; then
+      break
+    fi
+
     # remove CR
     cleaned="${line//$'\r'/}"
     # trim leading spaces
@@ -58,9 +66,21 @@ read_until_marker() {
     # trim trailing spaces
     cleaned="${cleaned%"${cleaned##*[![:space:]]}"}"
 
-    [[ "$cleaned" == "$marker" ]] && break
+    # marker line (case-insensitive)
+    if [[ "${cleaned^^}" == "${marker^^}" ]]; then
+      break
+    fi
+
     printf "%s\n" "$line"
   done
+
+  return 0
+}
+
+ask_continue(){
+  local cont
+  read -r -p "是否继续？(y/N): " cont </dev/tty
+  [[ "$cont" =~ ^[Yy]$ ]]
 }
 
 # ================= Step 1: OS check =================
@@ -70,20 +90,18 @@ if ! command -v lsb_release >/dev/null 2>&1; then
   apt install -y lsb-release >/dev/null
 fi
 
-OS_MAJOR="$(lsb_release -rs | cut -d. -f1 || true)"
+OS_MAJOR="$(lsb_release -rs 2>/dev/null | cut -d. -f1 || true)"
 if [[ -z "$OS_MAJOR" ]]; then
   warn "无法检测 Ubuntu 版本，可能失败"
-  read -r -p "是否继续？(y/N): " cont
-  [[ "$cont" =~ ^[Yy]$ ]] || exit 1
+  ask_continue || exit 1
 elif [[ "$OS_MAJOR" -lt 24 ]]; then
   warn "检测到 Ubuntu 版本低于 24，可能失败"
-  read -r -p "是否继续？(y/N): " cont
-  [[ "$cont" =~ ^[Yy]$ ]] || exit 1
+  ask_continue || exit 1
 fi
 ok "系统版本检查通过"
 
 # ================= Step 2: Domain + ping check =================
-read -r -p "请输入已解析好的域名（例如 api.duduu.cc）: " DOMAIN
+read -r -p "请输入已解析好的域名（例如 api.duduu.cc32）: " DOMAIN </dev/tty
 [[ -n "$DOMAIN" ]] || abort "域名不能为空"
 
 echo -e "${CYAN}▶ ping 测试域名解析...${RESET}"
@@ -96,13 +114,11 @@ if [[ -n "$SERVER_IP" ]]; then
   echo "本机公网 IP: $SERVER_IP"
   if [[ "$PING_IP" != "$SERVER_IP" ]]; then
     warn "域名解析 IP 与本机公网 IP 不一致，可能不是目标服务器"
-    read -r -p "是否继续？(y/N): " cont
-    [[ "$cont" =~ ^[Yy]$ ]] || exit 1
+    ask_continue || exit 1
   fi
 else
   warn "无法获取本机公网 IP（ipify 不可用），仅完成 ping 校验"
-  read -r -p "是否继续？(y/N): " cont
-  [[ "$cont" =~ ^[Yy]$ ]] || exit 1
+  ask_continue || exit 1
 fi
 ok "域名解析检查完成"
 
@@ -130,7 +146,7 @@ echo
 echo "请选择证书方式："
 echo "1) Let's Encrypt【自动申请续期】"
 echo "2) Cloudflare【橙云，自行上传证书】"
-read -r -p "请输入选择 [1/2]: " CERT_MODE
+read -r -p "请输入选择 [1/2]: " CERT_MODE </dev/tty
 
 if [[ "$CERT_MODE" != "1" && "$CERT_MODE" != "2" ]]; then
   abort "无效选择：$CERT_MODE"
@@ -172,7 +188,7 @@ fi
 
 # ---------- Mode 2: Cloudflare paste PEM/KEY with EOF ----------
 if [[ "$CERT_MODE" == "2" ]]; then
-  echo -e "${CYAN}▶ Cloudflare 方式：粘贴 pem/key（输入 EOF + 回车结束）...${RESET}"
+  echo -e "${CYAN}▶ Cloudflare 方式：粘贴 pem/key（输入 EOF/eof + 回车结束，或 Ctrl-D 结束）...${RESET}"
 
   PEM="/etc/ssl/cloudflare/${DOMAIN}.pem"
   KEY="/etc/ssl/cloudflare/${DOMAIN}.key"
@@ -183,13 +199,21 @@ if [[ "$CERT_MODE" == "2" ]]; then
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM：${RESET}"
-  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 PEM 输入（EOF 单独一行即可）${RESET}"
+  echo -e "${YELLOW}粘贴完成后输入一行：EOF（大小写均可）然后回车结束；也可按 Ctrl-D 结束${RESET}"
   read_until_marker "EOF" > "$PEM"
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY：${RESET}"
-  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 KEY 输入（EOF 单独一行即可）${RESET}"
+  echo -e "${YELLOW}粘贴完成后输入一行：EOF（大小写均可）然后回车结束；也可按 Ctrl-D 结束${RESET}"
   read_until_marker "EOF" > "$KEY"
+
+  # basic sanity checks (not strict)
+  if ! grep -q "BEGIN" "$PEM"; then
+    warn "PEM 看起来不像完整证书（未检测到 BEGIN 行），后续可能失败"
+  fi
+  if ! grep -q "BEGIN" "$KEY"; then
+    warn "KEY 看起来不像完整私钥（未检测到 BEGIN 行），后续可能失败"
+  fi
 
   cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
