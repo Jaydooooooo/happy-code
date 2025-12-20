@@ -41,6 +41,18 @@ if [[ $EUID -ne 0 ]]; then
   abort "请使用 root 执行（sudo -i 后运行或 sudo bash 脚本）"
 fi
 
+# ================= Helper: read until marker line =================
+# Reads multi-line input until the user enters a line that equals MARKER (default: EOF).
+# That marker line will NOT be written to file.
+read_until_marker() {
+  local marker="${1:-EOF}"
+  local line
+  while IFS= read -r line; do
+    [[ "$line" == "$marker" ]] && break
+    printf "%s\n" "$line"
+  done
+}
+
 # ================= Step 1: OS check =================
 echo -e "${CYAN}▶ 检查系统版本...${RESET}"
 if ! command -v lsb_release >/dev/null 2>&1; then
@@ -61,7 +73,7 @@ fi
 ok "系统版本检查通过"
 
 # ================= Step 2: Domain + ping check =================
-read -r -p "请输入已解析好的域名（例如 api.duduu.cc）: " DOMAIN
+read -r -p "请输入已解析好的域名（例如 api.explame.cc）: " DOMAIN
 [[ -n "$DOMAIN" ]] || abort "域名不能为空"
 
 echo -e "${CYAN}▶ ping 测试域名解析...${RESET}"
@@ -92,7 +104,6 @@ apt install -y debian-keyring debian-archive-keyring apt-transport-https
 ok "Docker 与基础依赖安装完成"
 
 echo -e "${CYAN}▶ 安装 Caddy...${RESET}"
-# ensure gpg exists
 apt install -y gnupg curl >/dev/null 2>&1 || true
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
   | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -120,7 +131,6 @@ if [[ "$CERT_MODE" == "1" ]]; then
   echo -e "${CYAN}▶ Let's Encrypt 方式：申请证书并自动续期...${RESET}"
   apt install -y certbot
 
-  # stop caddy to free :80 for certbot standalone
   systemctl stop caddy >/dev/null 2>&1 || true
 
   certbot certonly --standalone --non-interactive --agree-tos \
@@ -145,7 +155,6 @@ EOF
   systemctl start caddy
   systemctl reload caddy || systemctl restart caddy
 
-  # renew every 60 days
   cat > /etc/cron.d/happy-certbot <<EOF
 # Happy certbot renew (every 60 days)
 0 3 */60 * * root certbot renew --quiet --deploy-hook 'systemctl reload caddy || systemctl restart caddy'
@@ -154,9 +163,9 @@ EOF
   ok "Let's Encrypt 配置完成"
 fi
 
-# ---------- Mode 2: Cloudflare (Ctrl+D end) ----------
+# ---------- Mode 2: Cloudflare paste PEM/KEY with EOF ----------
 if [[ "$CERT_MODE" == "2" ]]; then
-  echo -e "${CYAN}▶ Cloudflare 方式：粘贴 pem/key（用 Ctrl+D 结束）...${RESET}"
+  echo -e "${CYAN}▶ Cloudflare 方式：粘贴 pem/key（输入 EOF + 回车结束）...${RESET}"
 
   PEM="/etc/ssl/cloudflare/${DOMAIN}.pem"
   KEY="/etc/ssl/cloudflare/${DOMAIN}.key"
@@ -166,12 +175,14 @@ if [[ "$CERT_MODE" == "2" ]]; then
   chmod 600 "$PEM" "$KEY" || true
 
   echo
-  echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM，粘贴完成后按 Ctrl+D 结束：${RESET}"
-  cat > "$PEM"
+  echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM：${RESET}"
+  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 PEM 输入${RESET}"
+  read_until_marker "EOF" > "$PEM"
 
   echo
-  echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY，粘贴完成后按 Ctrl+D 结束：${RESET}"
-  cat > "$KEY"
+  echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY：${RESET}"
+  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 KEY 输入${RESET}"
+  read_until_marker "EOF" > "$KEY"
 
   cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
@@ -192,7 +203,7 @@ EOF
   ok "Cloudflare 证书配置完成"
 fi
 
-# ================= Step 5: Caddy reload + 443 check =================
+# ================= Step 5: 443 check =================
 echo -e "${CYAN}▶ 检查 443 监听...${RESET}"
 if ss -lntp | grep -q ':443'; then
   ok "443 端口监听正常"
