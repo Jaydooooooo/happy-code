@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+、#!/usr/bin/env bash
 set -Eeuo pipefail
 
 # ================= UI =================
@@ -41,61 +41,6 @@ if [[ $EUID -ne 0 ]]; then
   abort "请使用 root 执行（sudo -i 后运行或 sudo bash 脚本）"
 fi
 
-ask_continue(){
-  local cont
-  read -r -p "是否继续？(y/N): " cont </dev/tty
-  [[ "$cont" =~ ^[Yy]$ ]]
-}
-
-# ================= Helper: read until marker line =================
-# 解决你遇到的：粘贴后输入 EOF / Ctrl-D 无反应（常见原因：bracketed paste/不可见控制字符）
-# - 从 /dev/tty 读，避免 stdout 重定向影响交互
-# - 支持 EOF/eof 大小写
-# - 支持 Ctrl-D 结束
-# - 清除 \r、ESC[200~/ESC[201~、ANSI 控制序列、其它不可见控制字符
-read_until_marker() {
-  local marker="${1:-EOF}"
-  local line cleaned
-
-  # 尝试关闭 bracketed paste（有些终端支持，有些不支持；不支持也没事）
-  printf '\e[?2004l' >/dev/tty 2>/dev/null || true
-
-  while true; do
-    if ! IFS= read -r line </dev/tty; then
-      # Ctrl-D / 真 EOF
-      break
-    fi
-
-    cleaned="$line"
-
-    # 1) 去掉 Windows CR
-    cleaned="${cleaned//$'\r'/}"
-
-    # 2) 去掉 bracketed paste 标记（常见 ESC[200~ / ESC[201~）
-    cleaned="${cleaned//$'\e[200~'/}"
-    cleaned="${cleaned//$'\e[201~'/}"
-
-    # 3) 去掉 ANSI 控制序列（ESC [ ...）
-    cleaned="$(printf '%s' "$cleaned" | sed -r $'s/\x1B\\[[0-9;?]*[ -/]*[@-~]//g')"
-
-    # 4) 去掉其它不可见控制字符（保留可见文本）
-    cleaned="$(printf '%s' "$cleaned" | tr -d '\000-\011\013\014\016-\037\177')"
-
-    # 5) trim 前后空白
-    cleaned="${cleaned#"${cleaned%%[![:space:]]*}"}"
-    cleaned="${cleaned%"${cleaned##*[![:space:]]}"}"
-
-    # marker：大小写不敏感
-    if [[ "${cleaned^^}" == "${marker^^}" ]]; then
-      break
-    fi
-
-    printf "%s\n" "$line"
-  done
-
-  return 0
-}
-
 # ================= Step 1: OS check =================
 echo -e "${CYAN}▶ 检查系统版本...${RESET}"
 if ! command -v lsb_release >/dev/null 2>&1; then
@@ -103,18 +48,20 @@ if ! command -v lsb_release >/dev/null 2>&1; then
   apt install -y lsb-release >/dev/null
 fi
 
-OS_MAJOR="$(lsb_release -rs 2>/dev/null | cut -d. -f1 || true)"
+OS_MAJOR="$(lsb_release -rs | cut -d. -f1 || true)"
 if [[ -z "$OS_MAJOR" ]]; then
   warn "无法检测 Ubuntu 版本，可能失败"
-  ask_continue || exit 1
+  read -r -p "是否继续？(y/N): " cont
+  [[ "$cont" =~ ^[Yy]$ ]] || exit 1
 elif [[ "$OS_MAJOR" -lt 24 ]]; then
   warn "检测到 Ubuntu 版本低于 24，可能失败"
-  ask_continue || exit 1
+  read -r -p "是否继续？(y/N): " cont
+  [[ "$cont" =~ ^[Yy]$ ]] || exit 1
 fi
 ok "系统版本检查通过"
 
 # ================= Step 2: Domain + ping check =================
-read -r -p "请输入已解析好的域名（例如 api.duduu36.cc）: " DOMAIN </dev/tty
+read -r -p "请输入已解析好的域名（例如 api.duduu.cc44）: " DOMAIN
 [[ -n "$DOMAIN" ]] || abort "域名不能为空"
 
 echo -e "${CYAN}▶ ping 测试域名解析...${RESET}"
@@ -127,22 +74,23 @@ if [[ -n "$SERVER_IP" ]]; then
   echo "本机公网 IP: $SERVER_IP"
   if [[ "$PING_IP" != "$SERVER_IP" ]]; then
     warn "域名解析 IP 与本机公网 IP 不一致，可能不是目标服务器"
-    ask_continue || exit 1
+    read -r -p "是否继续？(y/N): " cont
+    [[ "$cont" =~ ^[Yy]$ ]] || exit 1
   fi
 else
   warn "无法获取本机公网 IP（ipify 不可用），仅完成 ping 校验"
-  ask_continue || exit 1
+  read -r -p "是否继续？(y/N): " cont
+  [[ "$cont" =~ ^[Yy]$ ]] || exit 1
 fi
 ok "域名解析检查完成"
 
-# ================= Step 3: Install Docker & deps =================
+# ================= Step 3: Run commands =================
 echo -e "${CYAN}▶ 安装 Docker 与基础依赖...${RESET}"
 apt update
 curl -fsSL https://get.docker.com | sh
 apt install -y debian-keyring debian-archive-keyring apt-transport-https
 ok "Docker 与基础依赖安装完成"
 
-# ================= Step 3.5: Install Caddy =================
 echo -e "${CYAN}▶ 安装 Caddy...${RESET}"
 apt install -y gnupg curl >/dev/null 2>&1 || true
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -160,7 +108,7 @@ echo
 echo "请选择证书方式："
 echo "1) Let's Encrypt【自动申请续期】"
 echo "2) Cloudflare【橙云，自行上传证书】"
-read -r -p "请输入选择 [1/2]: " CERT_MODE </dev/tty
+read -r -p "请输入选择 [1/2]: " CERT_MODE
 
 if [[ "$CERT_MODE" != "1" && "$CERT_MODE" != "2" ]]; then
   abort "无效选择：$CERT_MODE"
@@ -200,9 +148,9 @@ EOF
   ok "Let's Encrypt 配置完成"
 fi
 
-# ---------- Mode 2: Cloudflare ----------
+# ---------- Mode 2: Cloudflare paste PEM/KEY with EOF ----------
 if [[ "$CERT_MODE" == "2" ]]; then
-  echo -e "${CYAN}▶ Cloudflare 方式：粘贴 pem/key（输入 EOF/eof + 回车结束，或 Ctrl-D 结束）...${RESET}"
+  echo -e "${CYAN}▶ Cloudflare 方式：粘贴 pem/key（输入 EOF + 回车结束）...${RESET}"
 
   PEM="/etc/ssl/cloudflare/${DOMAIN}.pem"
   KEY="/etc/ssl/cloudflare/${DOMAIN}.key"
@@ -213,21 +161,15 @@ if [[ "$CERT_MODE" == "2" ]]; then
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM：${RESET}"
-  echo -e "${YELLOW}完成后输入一行 EOF（大小写均可）+ 回车结束；也可按 Ctrl-D 结束${RESET}"
-  read_until_marker "EOF" > "$PEM"
+  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 PEM 输入（EOF 单独一行即可）${RESET}"
+  cat > "$PEM" <<'EOF'
+EOF
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY：${RESET}"
-  echo -e "${YELLOW}完成后输入一行 EOF（大小写均可）+ 回车结束；也可按 Ctrl-D 结束${RESET}"
-  read_until_marker "EOF" > "$KEY"
-
-  # sanity check
-  if ! grep -q "BEGIN CERTIFICATE" "$PEM" 2>/dev/null; then
-    warn "PEM 未检测到 BEGIN CERTIFICATE，可能不是完整证书链（不一定致命，但建议检查）"
-  fi
-  if ! grep -q "BEGIN .*PRIVATE KEY" "$KEY" 2>/dev/null; then
-    warn "KEY 未检测到 BEGIN PRIVATE KEY，可能不是完整私钥（建议检查）"
-  fi
+  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 KEY 输入（EOF 单独一行即可）${RESET}"
+  cat > "$KEY" <<'EOF'
+EOF
 
   cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
@@ -297,3 +239,4 @@ fi
 summary
 echo -e "${GREEN}服务器已部署完毕！${RESET}"
 echo "使用浏览器访问：https://${DOMAIN} 你应该会看到网页已顺利打开"
+、
