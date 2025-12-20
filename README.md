@@ -1,11 +1,13 @@
 怎么使用？使用root
 
-运行以下服务端命令
+运行以下【通讯服务端命令】
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Jaydooooooo/happy-code/main/install-happy.sh)
 ```
 
+
+【你的happy 端运行以下命令】
 [安装项目地址命令](https://github.com/slopus/happy)
 ```bash
 npm install -g happy-coder
