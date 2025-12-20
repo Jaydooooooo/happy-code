@@ -41,32 +41,51 @@ if [[ $EUID -ne 0 ]]; then
   abort "请使用 root 执行（sudo -i 后运行或 sudo bash 脚本）"
 fi
 
+ask_continue(){
+  local cont
+  read -r -p "是否继续？(y/N): " cont </dev/tty
+  [[ "$cont" =~ ^[Yy]$ ]]
+}
+
 # ================= Helper: read until marker line =================
-# Reads multi-line input until user enters a line equals MARKER (default: EOF) OR user presses Ctrl-D.
-# - Strips Windows CR (\r)
-# - Trims leading/trailing spaces
-# - Marker match is case-insensitive (EOF / eof both ok)
-# - Marker line will NOT be written to output
-# Notes:
-# - Always reads from /dev/tty (interactive terminal), so redirection like `> file` is safe.
+# 解决你遇到的：粘贴后输入 EOF / Ctrl-D 无反应（常见原因：bracketed paste/不可见控制字符）
+# - 从 /dev/tty 读，避免 stdout 重定向影响交互
+# - 支持 EOF/eof 大小写
+# - 支持 Ctrl-D 结束
+# - 清除 \r、ESC[200~/ESC[201~、ANSI 控制序列、其它不可见控制字符
 read_until_marker() {
   local marker="${1:-EOF}"
   local line cleaned
 
+  # 尝试关闭 bracketed paste（有些终端支持，有些不支持；不支持也没事）
+  printf '\e[?2004l' >/dev/tty 2>/dev/null || true
+
   while true; do
-    # Ctrl-D / true EOF => read fails => stop safely (don't break set -e)
     if ! IFS= read -r line </dev/tty; then
+      # Ctrl-D / 真 EOF
       break
     fi
 
-    # remove CR
-    cleaned="${line//$'\r'/}"
-    # trim leading spaces
+    cleaned="$line"
+
+    # 1) 去掉 Windows CR
+    cleaned="${cleaned//$'\r'/}"
+
+    # 2) 去掉 bracketed paste 标记（常见 ESC[200~ / ESC[201~）
+    cleaned="${cleaned//$'\e[200~'/}"
+    cleaned="${cleaned//$'\e[201~'/}"
+
+    # 3) 去掉 ANSI 控制序列（ESC [ ...）
+    cleaned="$(printf '%s' "$cleaned" | sed -r $'s/\x1B\\[[0-9;?]*[ -/]*[@-~]//g')"
+
+    # 4) 去掉其它不可见控制字符（保留可见文本）
+    cleaned="$(printf '%s' "$cleaned" | tr -d '\000-\011\013\014\016-\037\177')"
+
+    # 5) trim 前后空白
     cleaned="${cleaned#"${cleaned%%[![:space:]]*}"}"
-    # trim trailing spaces
     cleaned="${cleaned%"${cleaned##*[![:space:]]}"}"
 
-    # marker line (case-insensitive)
+    # marker：大小写不敏感
     if [[ "${cleaned^^}" == "${marker^^}" ]]; then
       break
     fi
@@ -75,12 +94,6 @@ read_until_marker() {
   done
 
   return 0
-}
-
-ask_continue(){
-  local cont
-  read -r -p "是否继续？(y/N): " cont </dev/tty
-  [[ "$cont" =~ ^[Yy]$ ]]
 }
 
 # ================= Step 1: OS check =================
@@ -101,7 +114,7 @@ fi
 ok "系统版本检查通过"
 
 # ================= Step 2: Domain + ping check =================
-read -r -p "请输入已解析好的域名（例如 api.duduu.cc32）: " DOMAIN </dev/tty
+read -r -p "请输入已解析好的域名（例如 api.duduu36.cc）: " DOMAIN </dev/tty
 [[ -n "$DOMAIN" ]] || abort "域名不能为空"
 
 echo -e "${CYAN}▶ ping 测试域名解析...${RESET}"
@@ -122,13 +135,14 @@ else
 fi
 ok "域名解析检查完成"
 
-# ================= Step 3: Run commands =================
+# ================= Step 3: Install Docker & deps =================
 echo -e "${CYAN}▶ 安装 Docker 与基础依赖...${RESET}"
 apt update
 curl -fsSL https://get.docker.com | sh
 apt install -y debian-keyring debian-archive-keyring apt-transport-https
 ok "Docker 与基础依赖安装完成"
 
+# ================= Step 3.5: Install Caddy =================
 echo -e "${CYAN}▶ 安装 Caddy...${RESET}"
 apt install -y gnupg curl >/dev/null 2>&1 || true
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -186,7 +200,7 @@ EOF
   ok "Let's Encrypt 配置完成"
 fi
 
-# ---------- Mode 2: Cloudflare paste PEM/KEY with EOF ----------
+# ---------- Mode 2: Cloudflare ----------
 if [[ "$CERT_MODE" == "2" ]]; then
   echo -e "${CYAN}▶ Cloudflare 方式：粘贴 pem/key（输入 EOF/eof + 回车结束，或 Ctrl-D 结束）...${RESET}"
 
@@ -199,20 +213,20 @@ if [[ "$CERT_MODE" == "2" ]]; then
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM：${RESET}"
-  echo -e "${YELLOW}粘贴完成后输入一行：EOF（大小写均可）然后回车结束；也可按 Ctrl-D 结束${RESET}"
+  echo -e "${YELLOW}完成后输入一行 EOF（大小写均可）+ 回车结束；也可按 Ctrl-D 结束${RESET}"
   read_until_marker "EOF" > "$PEM"
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY：${RESET}"
-  echo -e "${YELLOW}粘贴完成后输入一行：EOF（大小写均可）然后回车结束；也可按 Ctrl-D 结束${RESET}"
+  echo -e "${YELLOW}完成后输入一行 EOF（大小写均可）+ 回车结束；也可按 Ctrl-D 结束${RESET}"
   read_until_marker "EOF" > "$KEY"
 
-  # basic sanity checks (not strict)
-  if ! grep -q "BEGIN" "$PEM"; then
-    warn "PEM 看起来不像完整证书（未检测到 BEGIN 行），后续可能失败"
+  # sanity check
+  if ! grep -q "BEGIN CERTIFICATE" "$PEM" 2>/dev/null; then
+    warn "PEM 未检测到 BEGIN CERTIFICATE，可能不是完整证书链（不一定致命，但建议检查）"
   fi
-  if ! grep -q "BEGIN" "$KEY"; then
-    warn "KEY 看起来不像完整私钥（未检测到 BEGIN 行），后续可能失败"
+  if ! grep -q "BEGIN .*PRIVATE KEY" "$KEY" 2>/dev/null; then
+    warn "KEY 未检测到 BEGIN PRIVATE KEY，可能不是完整私钥（建议检查）"
   fi
 
   cat > /etc/caddy/Caddyfile <<EOF
