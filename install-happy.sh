@@ -42,13 +42,23 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ================= Helper: read until marker line =================
-# Reads multi-line input until the user enters a line that equals MARKER (default: EOF).
-# That marker line will NOT be written to file.
+# Reads multi-line input until user enters a line equals MARKER (default: EOF).
+# - Strips Windows CR (\r)
+# - Trims leading/trailing spaces
+# - Marker line will NOT be written to file
 read_until_marker() {
   local marker="${1:-EOF}"
-  local line
+  local line cleaned
+
   while IFS= read -r line; do
-    [[ "$line" == "$marker" ]] && break
+    # remove CR
+    cleaned="${line//$'\r'/}"
+    # trim leading spaces
+    cleaned="${cleaned#"${cleaned%%[![:space:]]*}"}"
+    # trim trailing spaces
+    cleaned="${cleaned%"${cleaned##*[![:space:]]}"}"
+
+    [[ "$cleaned" == "$marker" ]] && break
     printf "%s\n" "$line"
   done
 }
@@ -73,7 +83,7 @@ fi
 ok "系统版本检查通过"
 
 # ================= Step 2: Domain + ping check =================
-read -r -p "请输入已解析好的域名（例如 api.explame.cc）: " DOMAIN
+read -r -p "请输入已解析好的域名（例如 api.duduu.cc）: " DOMAIN
 [[ -n "$DOMAIN" ]] || abort "域名不能为空"
 
 echo -e "${CYAN}▶ ping 测试域名解析...${RESET}"
@@ -140,9 +150,7 @@ if [[ "$CERT_MODE" == "1" ]]; then
   cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
     tls /etc/letsencrypt/live/${DOMAIN}/fullchain.pem /etc/letsencrypt/live/${DOMAIN}/privkey.pem
-
     encode gzip
-
     reverse_proxy 127.0.0.1:3000 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
@@ -156,7 +164,6 @@ EOF
   systemctl reload caddy || systemctl restart caddy
 
   cat > /etc/cron.d/happy-certbot <<EOF
-# Happy certbot renew (every 60 days)
 0 3 */60 * * root certbot renew --quiet --deploy-hook 'systemctl reload caddy || systemctl restart caddy'
 EOF
 
@@ -176,20 +183,18 @@ if [[ "$CERT_MODE" == "2" ]]; then
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM：${RESET}"
-  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 PEM 输入${RESET}"
+  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 PEM 输入（EOF 单独一行即可）${RESET}"
   read_until_marker "EOF" > "$PEM"
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY：${RESET}"
-  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 KEY 输入${RESET}"
+  echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 KEY 输入（EOF 单独一行即可）${RESET}"
   read_until_marker "EOF" > "$KEY"
 
   cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
     tls ${PEM} ${KEY}
-
     encode gzip
-
     reverse_proxy 127.0.0.1:3000 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
@@ -239,11 +244,7 @@ ok "Happy 镜像构建成功"
 # ================= Step 7: Run container =================
 echo -e "${CYAN}▶ 启动 Happy 容器...${RESET}"
 docker rm -f happy >/dev/null 2>&1 || true
-docker run -d \
-  --name happy \
-  --restart unless-stopped \
-  -p 127.0.0.1:3000:80 \
-  happy:local >/dev/null
+docker run -d --name happy --restart unless-stopped -p 127.0.0.1:3000:80 happy:local >/dev/null
 ok "Happy 容器启动成功"
 
 # ================= Step 8: Final curl =================
