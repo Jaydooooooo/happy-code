@@ -1,4 +1,4 @@
-、#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -Eeuo pipefail
 
 # ================= UI =================
@@ -61,7 +61,7 @@ fi
 ok "系统版本检查通过"
 
 # ================= Step 2: Domain + ping check =================
-read -r -p "请输入已解析好的域名（例如 api.duduu.cc44）: " DOMAIN
+read -r -p "请输入已解析好的域名（例如 api.duduu.cc48）: " DOMAIN
 [[ -n "$DOMAIN" ]] || abort "域名不能为空"
 
 echo -e "${CYAN}▶ ping 测试域名解析...${RESET}"
@@ -162,12 +162,14 @@ if [[ "$CERT_MODE" == "2" ]]; then
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM：${RESET}"
   echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 PEM 输入（EOF 单独一行即可）${RESET}"
+  # ✅ 关键修复：这里会进入 heredoc 录入模式，等待你输入 EOF 结束
   cat > "$PEM" <<'EOF'
 EOF
 
   echo
   echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY：${RESET}"
   echo -e "${YELLOW}粘贴完成后输入一行：EOF 然后回车结束 KEY 输入（EOF 单独一行即可）${RESET}"
+  # ✅ 同上：等待你输入 EOF 结束
   cat > "$KEY" <<'EOF'
 EOF
 
@@ -239,4 +241,3 @@ fi
 summary
 echo -e "${GREEN}服务器已部署完毕！${RESET}"
 echo "使用浏览器访问：https://${DOMAIN} 你应该会看到网页已顺利打开"
-、
