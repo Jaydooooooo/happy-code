@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # Happy self-host installer (Ubuntu 24+)
 # - Docker + Caddy
-# - TLS: Let's Encrypt (auto) OR Cloudflare Origin Cert (manual paste)
+# - TLS: Let's Encrypt OR Cloudflare Origin Cert (paste PEM/KEY, end with Enter)
 # - Builds Happy from source (auto clone if missing)
 #
 # Usage:
 #   chmod +x install-happy.sh
-#   ./install-happy.sh
+#   sudo ./install-happy.sh
 #
-# Notes:
-# - Run as root (recommended).
-# - This script will create/use /root/happy as the source dir by default.
+# One-liner:
+#   sudo bash <(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/install-happy.sh)
 
 set -Eeuo pipefail
 
@@ -25,16 +24,10 @@ FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}!${RESET}"
 
 declare -A STEP_STATUS
+
 step_ok()   { echo -e "${OK} $1"; STEP_STATUS["$1"]="OK"; }
 step_fail() { echo -e "${FAIL} $1"; STEP_STATUS["$1"]="FAIL"; }
 step_warn() { echo -e "${WARN} $1"; }
-
-abort() {
-  local msg="${1:-Unknown error}"
-  echo -e "\n${RED}ERROR:${RESET} ${msg}\n"
-  print_summary
-  exit 1
-}
 
 print_summary() {
   echo -e "\n${CYAN}================ 安装结果汇总 ================${RESET}"
@@ -52,6 +45,13 @@ print_summary() {
   echo -e "${CYAN}=============================================${RESET}\n"
 }
 
+abort() {
+  local msg="${1:-Unknown error}"
+  echo -e "\n${RED}ERROR:${RESET} ${msg}\n"
+  print_summary
+  exit 1
+}
+
 on_err() {
   local exit_code=$?
   local line_no=$1
@@ -61,15 +61,37 @@ trap 'on_err $LINENO' ERR
 
 require_root() {
   if [ "${EUID}" -ne 0 ]; then
-    abort "请使用 root 运行（例如：sudo -i 后再执行脚本）。"
+    abort "请使用 root 运行（建议：sudo -i 后执行，或 sudo bash 脚本）。"
   fi
 }
 
 ### ============ Config ============
 HAPPY_REPO_URL="https://github.com/slopus/happy.git"
 DEFAULT_SRC_DIR="/root/happy"
+DOMAIN=""
+CERT_TYPE=""
+HAPPY_DIR=""
 
-### ============ Functions ============
+### ============ Helpers ============
+read_multiline_until_empty_line() {
+  # Reads multiple lines from STDIN until an empty line is received.
+  # Usage: read_multiline_until_empty_line VAR_NAME
+  local __varname="$1"
+  local content=""
+  local line=""
+
+  while IFS= read -r line; do
+    # empty line => end
+    if [ -z "$line" ]; then
+      break
+    fi
+    content+="${line}"$'\n'
+  done
+
+  # shellcheck disable=SC2163
+  printf -v "$__varname" "%s" "$content"
+}
+
 check_ubuntu_version() {
   echo -e "${CYAN}▶ 检查系统版本...${RESET}"
   if ! command -v lsb_release >/dev/null 2>&1; then
@@ -77,9 +99,8 @@ check_ubuntu_version() {
     apt install -y lsb-release >/dev/null
   fi
 
-  local ver
+  local ver major
   ver="$(lsb_release -rs 2>/dev/null || true)"
-  local major
   major="$(echo "$ver" | cut -d. -f1)"
 
   if [ -z "$major" ]; then
@@ -88,7 +109,7 @@ check_ubuntu_version() {
     [[ "${cont}" =~ ^[Yy]$ ]] || exit 1
   elif [ "$major" -lt 24 ]; then
     step_warn "检测到 Ubuntu ${ver}，建议 Ubuntu 24 或以上，可能失败"
-    read -r -p "是否继续？(y/N): " cont
+    read -r -p "是否继续安装？(y/N): " cont
     [[ "${cont}" =~ ^[Yy]$ ]] || exit 1
   fi
 
@@ -105,26 +126,24 @@ ask_domain_and_validate_ip() {
   echo "正在 ping 域名：${DOMAIN}"
   local ping_ip
   ping_ip="$(ping -c 1 "$DOMAIN" 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p' | head -n1 || true)"
-
   if [ -z "$ping_ip" ]; then
     abort "域名无法 ping 通：${DOMAIN}"
   fi
 
   local server_ip
   server_ip="$(curl -fsS https://api.ipify.org || true)"
-  if [ -z "$server_ip" ]; then
-    step_warn "无法获取本机公网 IP（ipify 不可达），将仅展示 ping 解析 IP"
-    echo "域名解析 IP: $ping_ip"
-    read -r -p "是否继续？(y/N): " cont
-    [[ "${cont}" =~ ^[Yy]$ ]] || exit 1
-  else
-    echo "域名解析 IP: $ping_ip"
+  echo "域名解析 IP: $ping_ip"
+  if [ -n "$server_ip" ]; then
     echo "本机公网 IP: $server_ip"
     if [ "$ping_ip" != "$server_ip" ]; then
       step_warn "域名 IP 与本机公网 IP 不一致，可能部署到错误服务器"
       read -r -p "是否继续？(y/N): " cont
       [[ "${cont}" =~ ^[Yy]$ ]] || exit 1
     fi
+  else
+    step_warn "无法获取本机公网 IP（ipify 不可达），仅展示 ping 解析 IP"
+    read -r -p "是否继续？(y/N): " cont
+    [[ "${cont}" =~ ^[Yy]$ ]] || exit 1
   fi
 
   step_ok "域名解析检查完成"
@@ -196,14 +215,25 @@ write_caddyfile_cloudflare() {
 
   : > "$pem"
   : > "$key"
-
-  echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM（粘贴完按 Enter 再 Ctrl+D 结束）${RESET}"
-  cat > "$pem"
-
-  echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY（粘贴完按 Enter 再 Ctrl+D 结束）${RESET}"
-  cat > "$key"
-
   chmod 600 "$pem" "$key"
+
+  echo -e "${YELLOW}请粘贴 Cloudflare Origin PEM（粘贴完成后直接按 Enter 结束；即输入一个空行结束）${RESET}"
+  echo -e "${YELLOW}提示：建议最后一行粘贴完后，再按一次 Enter 创建空行${RESET}"
+  local PEM_CONTENT=""
+  read_multiline_until_empty_line PEM_CONTENT
+  if [ -z "$PEM_CONTENT" ]; then
+    abort "PEM 内容为空，已中断。"
+  fi
+  printf "%s" "$PEM_CONTENT" > "$pem"
+
+  echo -e "${YELLOW}请粘贴 Cloudflare Origin KEY（粘贴完成后直接按 Enter 结束；即输入一个空行结束）${RESET}"
+  echo -e "${YELLOW}提示：建议最后一行粘贴完后，再按一次 Enter 创建空行${RESET}"
+  local KEY_CONTENT=""
+  read_multiline_until_empty_line KEY_CONTENT
+  if [ -z "$KEY_CONTENT" ]; then
+    abort "KEY 内容为空，已中断。"
+  fi
+  printf "%s" "$KEY_CONTENT" > "$key"
 
   cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
@@ -236,24 +266,21 @@ check_443_listen() {
 ensure_happy_source() {
   echo -e "${CYAN}▶ 准备 Happy 源码...${RESET}"
 
-  # Strategy:
   # 1) If current dir looks like repo root, use it
-  # 2) Else if DEFAULT_SRC_DIR exists and has Dockerfile, use it
-  # 3) Else clone into DEFAULT_SRC_DIR
-  HAPPY_DIR=""
-
   if [ -f "./Dockerfile" ] && [ -f "./package.json" ]; then
     HAPPY_DIR="$(pwd)"
     step_ok "使用当前目录作为 Happy 源码：${HAPPY_DIR}"
     return
   fi
 
+  # 2) Else if DEFAULT_SRC_DIR exists and has Dockerfile, use it
   if [ -f "${DEFAULT_SRC_DIR}/Dockerfile" ] && [ -f "${DEFAULT_SRC_DIR}/package.json" ]; then
     HAPPY_DIR="${DEFAULT_SRC_DIR}"
     step_ok "使用已有 Happy 源码：${HAPPY_DIR}"
     return
   fi
 
+  # 3) Else clone into DEFAULT_SRC_DIR
   step_warn "未找到 Happy 源码，将自动 clone 到 ${DEFAULT_SRC_DIR}"
   rm -rf "${DEFAULT_SRC_DIR}"
   git clone "${HAPPY_REPO_URL}" "${DEFAULT_SRC_DIR}"
@@ -294,12 +321,13 @@ run_happy_container() {
 final_test() {
   echo -e "${CYAN}▶ 最终验证...${RESET}"
 
-  # Let's Encrypt: direct curl should verify OK after issuance.
-  # Cloudflare Origin Cert (without proxy): direct curl verification may fail. But user usually uses orange-cloud (proxy) to get public cert.
+  # - Let's Encrypt: curl should validate normally (after issuance).
+  # - Cloudflare Origin Cert: if direct-to-origin (gray cloud), curl will fail verification (expected).
+  # - If orange-cloud (proxied), curl should validate (public cert from Cloudflare).
   if curl -I "https://${DOMAIN}" >/dev/null 2>&1; then
     step_ok "HTTPS 访问成功（curl 验证通过）"
   else
-    step_warn "curl 未通过证书验证（这在 Cloudflare Origin Cert + 非代理直连时是正常的）"
+    step_warn "curl 未通过证书验证（Cloudflare Origin Cert + 非代理直连时属正常）"
     step_ok "已完成部署（建议用浏览器访问验证）"
   fi
 }
