@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ====== 配置（通过环境变量传入）======
+DOMAIN="${DOMAIN:-}"
+EMAIL="${EMAIL:-}"
+HAPPY_PORT="${HAPPY_PORT:-3005}"     # happy-server 本地监听端口
+CADDYFILE="/etc/caddy/Caddyfile"
+
+# ====== 输出工具 ======
+ok()   { echo -e "\033[32m[OK]\033[0m $*"; }
+warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
+fail() { echo -e "\033[31m[FAIL]\033[0m $*"; exit 1; }
+
+trap 'fail "脚本在第 $LINENO 行失败：$BASH_COMMAND"' ERR
+
+need_root() { [ "$(id -u)" -eq 0 ] || fail "请用 root 运行"; }
+
+check_vars() {
+  [ -n "$DOMAIN" ] || fail "缺少 DOMAIN，例如：DOMAIN=happy.duduu.cc"
+  [ -n "$EMAIL" ]  || fail "缺少 EMAIL，例如：EMAIL=you@example.com"
+}
+
+apt_retry() {
+  # 简单重试，减少偶发网络/锁问题
+  local n=0
+  until "$@"; do
+    n=$((n+1))
+    [ "$n" -ge 5 ] && return 1
+    sleep 2
+  done
+}
+
+check_os() {
+  if ! command -v lsb_release >/dev/null 2>&1; then
+    apt_retry apt-get update -y
+    apt_retry apt-get install -y lsb-release
+  fi
+  local major
+  major="$(lsb_release -rs | cut -d. -f1)"
+  if [ "$major" -lt 22 ]; then
+    fail "系统版本过低：Ubuntu $major，建议 Ubuntu 22/24"
+  fi
+  ok "系统版本：$(lsb_release -ds)"
+}
+
+check_disk() {
+  # root 分区至少留 10G 空余，否则 docker build/拉镜像很容易炸
+  local avail_gb
+  avail_gb="$(df -BG / | awk 'NR==2{gsub("G","",$4);print $4}')"
+  if [ "${avail_gb:-0}" -lt 10 ]; then
+    warn "根分区可用空间仅 ${avail_gb}G，可能导致 Docker 拉取/构建失败（建议>=30G更稳）"
+  else
+    ok "磁盘可用空间：${avail_gb}G"
+  fi
+}
+
+install_base() {
+  ok "安装基础依赖..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt_retry apt-get update -y
+  apt_retry apt-get install -y curl ca-certificates gnupg git unzip
+  ok "基础依赖完成"
+}
+
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    ok "Docker 已安装：$(docker --version)"
+    return
+  fi
+  ok "安装 Docker..."
+  curl -fsSL https://get.docker.com | sh
+  systemctl enable --now docker
+  ok "Docker 安装完成"
+}
+
+install_caddy() {
+  if command -v caddy >/dev/null 2>&1; then
+    ok "Caddy 已安装：$(caddy version)"
+    return
+  fi
+  ok "安装 Caddy..."
+  apt_retry apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+  apt_retry apt-get update -y
+  apt_retry apt-get install -y caddy
+  systemctl enable --now caddy
+  ok "Caddy 安装完成"
+}
+
+deploy_happy_server() {
+  ok "部署 happy-server（Docker）..."
+
+  mkdir -p /opt/happy-server
+  cd /opt/happy-server
+
+  # 直接用 slopus/happy-server（不需要你本机 build，省磁盘/省失败率）
+  cat > docker-compose.yml <<YAML
+services:
+  happy-server:
+    image: slopus/happy-server:latest
+    container_name: happy-server
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "${HAPPY_PORT}"
+    ports:
+      - "127.0.0.1:${HAPPY_PORT}:${HAPPY_PORT}"
+YAML
+
+  docker compose up -d
+  ok "happy-server 容器已启动"
+}
+
+write_caddyfile() {
+  ok "写入 Caddyfile（自动申请证书：Let's Encrypt）..."
+  cat > "$CADDYFILE" <<CADDY
+${DOMAIN} {
+  encode gzip
+
+  # 证书邮箱（ACME）
+  tls ${EMAIL}
+
+  @api path /v1/* /health
+  reverse_proxy @api 127.0.0.1:${HAPPY_PORT}
+
+  respond "ok" 200
+}
+CADDY
+
+  caddy validate --config "$CADDYFILE"
+  systemctl reload caddy
+  ok "Caddy 已重载"
+}
+
+verify() {
+  ok "本机验证后端..."
+  curl -sS -i "http://127.0.0.1:${HAPPY_PORT}/health" || true
+
+  ok "外网验证（可能需要 DNS 生效 + 80/443 放通）..."
+  curl -sS -I "https://${DOMAIN}" || true
+
+  ok "验证 API 路由（期待不再是 405 nginx 静态页）..."
+  curl -sS -i -X POST "https://${DOMAIN}/v1/auth/request" \
+    -H "Content-Type: application/json" \
+    --data '{"publicKey":"test","supportsV2":true}' || true
+}
+
+main() {
+  need_root
+  check_vars
+  check_os
+  check_disk
+  install_base
+  install_docker
+  install_caddy
+  deploy_happy_server
+  write_caddyfile
+  verify
+  ok "完成 ✅ 现在 /v1/* 会被转发到 happy-server"
+}
+
+main "$@"
