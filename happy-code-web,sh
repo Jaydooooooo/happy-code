@@ -1,166 +1,334 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ====== 配置（通过环境变量传入）======
-DOMAIN="${DOMAIN:-}"
-EMAIL="${EMAIL:-}"
-HAPPY_PORT="${HAPPY_PORT:-3005}"     # happy-server 本地监听端口
-CADDYFILE="/etc/caddy/Caddyfile"
+### ===== 颜色 & 符号 =====
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
+OK="${GREEN}✔${RESET}"
+FAIL="${RED}✘${RESET}"
 
-# ====== 输出工具 ======
-ok()   { echo -e "\033[32m[OK]\033[0m $*"; }
-warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
-fail() { echo -e "\033[31m[FAIL]\033[0m $*"; exit 1; }
+declare -A STEP_STATUS
 
-trap 'fail "脚本在第 $LINENO 行失败：$BASH_COMMAND"' ERR
+log_ok()   { echo -e "$OK $1"; STEP_STATUS["$1"]="OK"; }
+log_fail() { echo -e "$FAIL $1"; STEP_STATUS["$1"]="FAIL"; }
+log_warn() { echo -e "${YELLOW}! $1${RESET}"; }
 
-need_root() { [ "$(id -u)" -eq 0 ] || fail "请用 root 运行"; }
+# 出错时打印具体位置（不改变交互）
+trap 'echo -e "${RED}[ERROR] 脚本在第 ${LINENO} 行失败：${BASH_COMMAND}${RESET}"' ERR
 
-check_vars() {
-  [ -n "$DOMAIN" ] || fail "缺少 DOMAIN，例如：DOMAIN=happy.duduu.cc"
-  [ -n "$EMAIL" ]  || fail "缺少 EMAIL，例如：EMAIL=you@example.com"
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}[ERROR] 请使用 root 运行该脚本${RESET}"
+    exit 1
+  fi
 }
 
-apt_retry() {
-  # 简单重试，减少偶发网络/锁问题
-  local n=0
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo -e "${RED}[ERROR] 缺少命令：$cmd${RESET}"
+    exit 1
+  fi
+}
+
+# apt 偶发失败/锁问题处理：等待锁 + 重试
+apt_wait_lock() {
+  local locks=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/lib/apt/lists/lock
+    /var/cache/apt/archives/lock
+  )
+  local waited=0
+  while :; do
+    local busy=0
+    for f in "${locks[@]}"; do
+      if fuser "$f" >/dev/null 2>&1; then
+        busy=1
+        break
+      fi
+    done
+    [ "$busy" -eq 0 ] && break
+    waited=$((waited+1))
+    if [ "$waited" -gt 60 ]; then
+      echo -e "${RED}[ERROR] apt/dpkg 锁等待超时${RESET}"
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+retry() {
+  local -r max=5
+  local n=1
   until "$@"; do
+    if [ "$n" -ge "$max" ]; then
+      return 1
+    fi
     n=$((n+1))
-    [ "$n" -ge 5 ] && return 1
     sleep 2
   done
 }
 
-check_os() {
-  if ! command -v lsb_release >/dev/null 2>&1; then
-    apt_retry apt-get update -y
-    apt_retry apt-get install -y lsb-release
-  fi
-  local major
-  major="$(lsb_release -rs | cut -d. -f1)"
-  if [ "$major" -lt 22 ]; then
-    fail "系统版本过低：Ubuntu $major，建议 Ubuntu 22/24"
-  fi
-  ok "系统版本：$(lsb_release -ds)"
+apt_update() {
+  apt_wait_lock
+  retry apt update -y
 }
 
-check_disk() {
-  # root 分区至少留 10G 空余，否则 docker build/拉镜像很容易炸
+apt_install() {
+  apt_wait_lock
+  retry apt install -y "$@"
+}
+
+curl_s() {
+  # curl -fsSL 的重试版本
+  retry curl -fsSL "$@"
+}
+
+get_public_ip() {
+  # ipify 偶发失败时重试
+  retry curl -s https://api.ipify.org
+}
+
+check_disk_hint() {
+  # 构建镜像容易爆盘，提前提示但不改变流程
   local avail_gb
   avail_gb="$(df -BG / | awk 'NR==2{gsub("G","",$4);print $4}')"
   if [ "${avail_gb:-0}" -lt 10 ]; then
-    warn "根分区可用空间仅 ${avail_gb}G，可能导致 Docker 拉取/构建失败（建议>=30G更稳）"
+    log_warn "根分区可用空间仅 ${avail_gb}G，构建 Docker 镜像可能失败（建议>=30G更稳）"
+  fi
+}
+
+require_root
+
+### ===== Step 1: 系统检查 =====
+echo "▶ 检查系统版本..."
+require_cmd lsb_release
+
+OS_VERSION=$(lsb_release -rs | cut -d. -f1)
+if [ "$OS_VERSION" -lt 24 ]; then
+  log_warn "检测到 Ubuntu $OS_VERSION，建议 Ubuntu 24 或以上"
+  read -p "是否继续安装？(y/N): " cont
+  [[ "$cont" != "y" && "$cont" != "Y" ]] && exit 1
+fi
+log_ok "系统版本检查通过"
+
+check_disk_hint
+
+### ===== Step 2: 域名与 IP 校验 =====
+read -p "请输入已解析到本服务器的域名（例如 api.example57.com）: " DOMAIN
+if [ -z "${DOMAIN:-}" ]; then
+  log_fail "域名不能为空"
+  exit 1
+fi
+
+echo "▶ 正在 ping 域名 $DOMAIN ..."
+# 更稳的解析：取 ping 输出中第一个括号内 IP
+PING_IP=$(ping -c 1 "$DOMAIN" 2>/dev/null | sed -n '1{s/.*(\([0-9a-fA-F\.:]\+\)).*/\1/p}')
+if [ -z "$PING_IP" ]; then
+  log_fail "域名无法 ping 通"
+  exit 1
+fi
+
+SERVER_IP="$(get_public_ip || true)"
+if [ -z "${SERVER_IP:-}" ]; then
+  log_warn "获取本机公网 IP 失败（ipify 可能暂时不可用），将跳过严格比对"
+else
+  echo "域名解析 IP: $PING_IP"
+  echo "本机公网 IP: $SERVER_IP"
+
+  if [ "$PING_IP" != "$SERVER_IP" ]; then
+    log_warn "域名 IP 与本机 IP 不一致，可能安装到错误服务器"
+    read -p "是否继续？(y/N): " cont
+    [[ "$cont" != "y" && "$cont" != "Y" ]] && exit 1
+  fi
+fi
+log_ok "域名解析检查完成"
+
+### ===== Step 3: 基础依赖 =====
+echo "▶ 安装基础组件..."
+export DEBIAN_FRONTEND=noninteractive
+
+# 尽量先保证 curl/ca-certificates 可用
+apt_update && \
+apt_install curl wget ca-certificates gnupg lsb-release git && \
+curl_s https://get.docker.com | sh && \
+apt_install debian-keyring debian-archive-keyring apt-transport-https && \
+log_ok "Docker 与基础依赖安装完成" || { log_fail "基础依赖安装失败"; exit 1; }
+
+# Docker 服务确认
+systemctl enable --now docker >/dev/null 2>&1 || true
+docker version >/dev/null 2>&1 || { log_fail "Docker 安装后不可用"; exit 1; }
+
+### ===== Step 4: 安装 Caddy =====
+echo "▶ 安装 Caddy..."
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg && \
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null && \
+apt_update && apt_install caddy && \
+log_ok "Caddy 安装完成" || { log_fail "Caddy 安装失败"; exit 1; }
+
+mkdir -p /etc/ssl/cloudflare
+
+### ===== Step 5: 证书选择 =====
+echo
+echo "请选择证书方式："
+echo "1) Let's Encrypt（自动申请 & 续期）"
+echo "2) Cloudflare Origin Cert（橙云，手动粘贴）"
+read -p "请输入选择 [1/2]: " CERT_TYPE
+
+# 写配置前备份，避免写坏导致不可恢复（不改变交互）
+if [ -f /etc/caddy/Caddyfile ]; then
+  cp -f /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)" || true
+fi
+
+if [ "$CERT_TYPE" == "1" ]; then
+  cat > /etc/caddy/Caddyfile <<EOF
+$DOMAIN {
+    reverse_proxy 127.0.0.1:3000
+}
+EOF
+
+  # 校验配置再 reload
+  caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 || { log_fail "Caddy 配置校验失败"; exit 1; }
+  systemctl reload caddy || systemctl restart caddy
+  log_ok "Caddy + Let's Encrypt 配置完成"
+
+elif [ "$CERT_TYPE" == "2" ]; then
+  PEM="/etc/ssl/cloudflare/$DOMAIN.pem"
+  KEY="/etc/ssl/cloudflare/$DOMAIN.key"
+  : > "$PEM"
+  : > "$KEY"
+
+  echo "▶ 请粘贴 Cloudflare Origin PEM（Ctrl+D 结束）"
+  cat > "$PEM"
+  echo "▶ 请粘贴 Cloudflare Origin KEY（Ctrl+D 结束）"
+  cat > "$KEY"
+
+  # 简单校验：避免空文件导致 caddy reload 失败（不改变交互提示）
+  if [ ! -s "$PEM" ] || [ ! -s "$KEY" ]; then
+    log_fail "证书内容为空（PEM/KEY 任意一个为空）"
+    exit 1
+  fi
+
+  cat > /etc/caddy/Caddyfile <<EOF
+$DOMAIN {
+    tls $PEM $KEY
+
+    encode gzip
+
+    reverse_proxy 127.0.0.1:3000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+}
+EOF
+
+  caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 || { log_fail "Caddy 配置校验失败"; exit 1; }
+  systemctl reload caddy || systemctl restart caddy
+  log_ok "Cloudflare 证书配置完成"
+else
+  log_fail "无效的证书选择"
+  exit 1
+fi
+
+### ===== Step 6: 验证 443 =====
+# 先看服务状态再看监听（更可靠）
+systemctl is-active --quiet caddy || { log_fail "Caddy 服务未运行"; exit 1; }
+ss -lntp | grep ':443' >/dev/null \
+  && log_ok "443 端口监听正常" \
+  || log_fail "443 未监听"
+
+### ===== Step 7: 定位/获取 Happy 源码目录 =====
+echo "▶ 定位 Happy 源码目录..."
+
+HAPPY_DIR=""
+
+# 1) 优先使用当前目录（如果有 Dockerfile）
+if [ -f "./Dockerfile" ] && [ -f "./package.json" ]; then
+  HAPPY_DIR="$(pwd)"
+fi
+
+# 2) 尝试 /root/happy
+if [ -z "$HAPPY_DIR" ] && [ -f "/root/happy/Dockerfile" ]; then
+  HAPPY_DIR="/root/happy"
+fi
+
+# 3) 尝试 /etc/happy（你现在就在这里）
+if [ -z "$HAPPY_DIR" ] && [ -f "/etc/happy/Dockerfile" ]; then
+  HAPPY_DIR="/etc/happy"
+fi
+
+# 4) 找不到就 clone 到 /root/happy
+if [ -z "$HAPPY_DIR" ]; then
+  log_warn "未找到 Happy 源码，将自动 clone 到 /root/happy"
+  rm -rf /root/happy
+  if git clone https://github.com/slopus/happy.git /root/happy; then
+    HAPPY_DIR="/root/happy"
+    log_ok "Happy 源码获取成功"
   else
-    ok "磁盘可用空间：${avail_gb}G"
+    log_fail "Happy 源码获取失败"
+    exit 1
   fi
-}
+else
+  log_ok "已找到 Happy 源码：$HAPPY_DIR"
+fi
 
-install_base() {
-  ok "安装基础依赖..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt_retry apt-get update -y
-  apt_retry apt-get install -y curl ca-certificates gnupg git unzip
-  ok "基础依赖完成"
-}
+# 最终兜底检查
+if [ ! -f "$HAPPY_DIR/Dockerfile" ]; then
+  log_fail "Happy 源码目录无 Dockerfile：$HAPPY_DIR"
+  exit 1
+fi
 
-install_docker() {
-  if command -v docker >/dev/null 2>&1; then
-    ok "Docker 已安装：$(docker --version)"
-    return
+### ===== Step 8: 构建 Happy（使用找到的 HAPPY_DIR） =====
+echo "▶ 构建 Happy 镜像（路径：$HAPPY_DIR）..."
+
+# 构建前再提示一次空间（不改流程）
+check_disk_hint
+
+if docker build -t happy:local "$HAPPY_DIR"; then
+  log_ok "Happy 镜像构建成功"
+else
+  # 常见错误提示（不改变原文，只加补充信息）
+  if grep -qi "no space left on device" /var/log/syslog 2>/dev/null; then
+    log_warn "检测到可能的磁盘空间不足（no space left on device）"
   fi
-  ok "安装 Docker..."
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable --now docker
-  ok "Docker 安装完成"
-}
+  log_fail "Happy 镜像构建失败（建议使用更高内存服务器）"
+  exit 1
+fi
 
-install_caddy() {
-  if command -v caddy >/dev/null 2>&1; then
-    ok "Caddy 已安装：$(caddy version)"
-    return
-  fi
-  ok "安装 Caddy..."
-  apt_retry apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-    | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-  apt_retry apt-get update -y
-  apt_retry apt-get install -y caddy
-  systemctl enable --now caddy
-  ok "Caddy 安装完成"
-}
+### ===== Step 9: 运行容器 =====
+docker rm -f happy >/dev/null 2>&1 || true
 
-deploy_happy_server() {
-  ok "部署 happy-server（Docker）..."
+docker run -d \
+  --name happy \
+  --restart unless-stopped \
+  -p 127.0.0.1:3000:80 \
+  happy:local \
+  && log_ok "Happy 容器启动成功" \
+  || { log_fail "Happy 容器启动失败"; exit 1; }
 
-  mkdir -p /opt/happy-server
-  cd /opt/happy-server
+### ===== Step 10: 最终验证 =====
+echo "▶ 验证访问..."
+if curl -Ik "https://$DOMAIN" >/dev/null 2>&1; then
+  log_ok "HTTPS 访问成功"
+else
+  log_fail "HTTPS 访问失败"
+fi
 
-  # 直接用 slopus/happy-server（不需要你本机 build，省磁盘/省失败率）
-  cat > docker-compose.yml <<YAML
-services:
-  happy-server:
-    image: slopus/happy-server:latest
-    container_name: happy-server
-    restart: unless-stopped
-    environment:
-      NODE_ENV: production
-      PORT: "${HAPPY_PORT}"
-    ports:
-      - "127.0.0.1:${HAPPY_PORT}:${HAPPY_PORT}"
-YAML
+### ===== 总结 =====
+echo
+echo "================ 安装结果汇总 ================"
+for k in "${!STEP_STATUS[@]}"; do
+  [[ "${STEP_STATUS[$k]}" == "OK" ]] \
+    && echo -e "$OK $k" \
+    || echo -e "$FAIL $k"
+done
 
-  docker compose up -d
-  ok "happy-server 容器已启动"
-}
-
-write_caddyfile() {
-  ok "写入 Caddyfile（自动申请证书：Let's Encrypt）..."
-  cat > "$CADDYFILE" <<CADDY
-${DOMAIN} {
-  encode gzip
-
-  # 证书邮箱（ACME）
-  tls ${EMAIL}
-
-  @api path /v1/* /health
-  reverse_proxy @api 127.0.0.1:${HAPPY_PORT}
-
-  respond "ok" 200
-}
-CADDY
-
-  caddy validate --config "$CADDYFILE"
-  systemctl reload caddy
-  ok "Caddy 已重载"
-}
-
-verify() {
-  ok "本机验证后端..."
-  curl -sS -i "http://127.0.0.1:${HAPPY_PORT}/health" || true
-
-  ok "外网验证（可能需要 DNS 生效 + 80/443 放通）..."
-  curl -sS -I "https://${DOMAIN}" || true
-
-  ok "验证 API 路由（期待不再是 405 nginx 静态页）..."
-  curl -sS -i -X POST "https://${DOMAIN}/v1/auth/request" \
-    -H "Content-Type: application/json" \
-    --data '{"publicKey":"test","supportsV2":true}' || true
-}
-
-main() {
-  need_root
-  check_vars
-  check_os
-  check_disk
-  install_base
-  install_docker
-  install_caddy
-  deploy_happy_server
-  write_caddyfile
-  verify
-  ok "完成 ✅ 现在 /v1/* 会被转发到 happy-server"
-}
-
-main "$@"
+echo
+echo -e "${GREEN}服务器已部署完毕！${RESET}"
+echo "👉 使用浏览器访问：https://$DOMAIN"
+echo "👉 你应该会看到网页已顺利打开"
